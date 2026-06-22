@@ -1,0 +1,24 @@
+[project]
+name = "voice-agent-demo"
+version = "0.1.0"
+description = "Multi-persona voice agent demo built on pipecat (4 personas with name-wake)"
+requires-python = ">=3.11"
+dependencies = [
+    "pipecat-ai[deepgram,cartesia,openai,silero,webrtc,websocket,runner]>=1.3.0",
+    "python-dotenv>=1.0",
+    "loguru>=0.7",
+    "pyyaml>=6.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.5",
+    "pytest>=8.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.uv]
+package = false
