@@ -24,6 +24,7 @@ import { useSettings } from './useSettings';
 import { PersonaConversation } from './PersonaConversation';
 import { AgentStatusInline } from './AgentStatusInline';
 import { SettingsDrawer } from './SettingsDrawer';
+import { SessionList } from './SessionList';
 
 export function HistorySidebar() {
   const client = usePipecatClient();
@@ -89,6 +90,7 @@ export function HistorySidebar() {
       </div>
 
       <div className="history-body">
+        <SessionList />
         <PersonaConversation />
       </div>
 

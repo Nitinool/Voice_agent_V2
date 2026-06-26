@@ -21,7 +21,7 @@ from loguru import logger
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import LLMRunFrame
+from pipecat.frames.frames import FunctionCallResultProperties, LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -32,6 +32,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
 from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 from pipecat.runner.types import RunnerArguments, SmallWebRTCRunnerArguments
 from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.llm_service import FunctionCallParams
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transcriptions.language import Language
 from pipecat.transports.base_transport import BaseTransport, TransportParams
@@ -42,6 +43,7 @@ from agent_status import AgentStatusManager
 from mimo_tts import MimoTTSService
 from persona_router import PersonaRouter
 from session_manager import SessionManager
+from weather_tool import get_weather
 
 load_dotenv(override=True)
 
@@ -109,8 +111,13 @@ def _collect_provider_metadata() -> dict:
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     # SessionManager（先建空 context，让它填 default persona 的 system prompt）
-    context = LLMContext()
+    # tools 注册到 context：direct function（get_weather）的 name/签名/docstring
+    # 自动变成 schema，LLM service 自动注册，无需 register_function。
+    context = LLMContext(tools=[get_weather])
     sm = SessionManager(_PERSONAS_YAML, context)
+    # 前端切会话 reload 时，URL ?session=sid → 连接后发 switch_session（见 SessionActivator）。
+    # 这里不靠 requestData 传 session_id（链路不稳），启动时按默认最新会话激活即可，
+    # SessionActivator 会在连接后纠正到目标会话。
     # P2: agent 状态管理器，初始时 default persona = online，其余 = idle
     asm = AgentStatusManager(
         agent_names=list(sm.all_names()),
@@ -158,6 +165,63 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     router = PersonaRouter(sm, asm)
 
+    # handoff_to：persona 交接工具。闭包捕获 router/sm。
+    # 时序设计（解决"转交话被记成 target 说的"问题）：
+    #   LLM 输出 content + tool_call 是并发的，content 的 TTS 和 tool 执行会抢，
+    #   工具切 voice 会抢在豆包 TTS 播放前 → 转交话用了 target 的 voice/身份。
+    #   解法：不让当前 persona 说转交话（prompt 约束），工具直接切 + 触发 target，
+    #   由 target 的 prompt 引导它先说一句承接（"豆包让我来回答…"）。
+    # run_llm=False：当前 persona 不再生成工具后回合（否则会补一句）。
+    async def handoff_to(params: FunctionCallParams, target: str, question: str) -> None:
+        """把用户的问题转交给另一个更合适的助手回答。
+
+        当用户的问题超出你当前助手的擅长领域时调用此工具。调用此工具时不要输出任何文字，
+        直接调用即可，目标助手会主动开口承接并回答。
+
+        Args:
+            target: 目标助手名，必须是以下之一：doubao（豆包）、xiaoai（小爱同学）、siri（Siri）、deepseek（DeepSeek）。不能填自己。
+            question: 要转交给目标助手的问题，原样转述用户的问题。
+        """
+        valid = {"doubao", "xiaoai", "siri", "deepseek"}
+        if target not in valid:
+            await params.result_callback(
+                {"error": f"无效的目标助手「{target}」，可选：{','.join(sorted(valid))}"},
+                properties=FunctionCallResultProperties(run_llm=False),
+            )
+            return
+        if target == sm.active_name:
+            await params.result_callback(
+                {"handed_off": False, "reason": f"{target} 已经是当前助手"},
+                properties=FunctionCallResultProperties(run_llm=False),
+            )
+            return
+        # 记下转交来源（switch 后 active 就变成 target 了，先存）
+        from_display = sm.active.display_name
+        # 1. 会话内切到 target（换 system 头 + 切 TTS voice + 通知前端，不丢历史）
+        cfg = await router.switch_to(target, triggered_by="handoff")
+        if cfg is None:
+            await params.result_callback(
+                {"error": f"切换到 {target} 失败"},
+                properties=FunctionCallResultProperties(run_llm=False),
+            )
+            return
+        # 2. 把问题作为干净的 user 消息灌进 context（此时 system 头已是 target 的 prompt）
+        #    [转交自XX] 前缀让 target 知道是转交来的，prompt 引导它先承接再答。
+        #    persona 由 _sync_context_to_session 自动标成当前 active（=target），符合预期。
+        sm.context.add_message(
+            {"role": "user", "content": f"[转交自{from_display}] {question}"}
+        )
+        # 3. 触发 target 的 LLM 回答
+        await params.llm.push_frame(LLMRunFrame())
+        # 4. 当前（原）persona 不再说话
+        await params.result_callback(
+            {"handed_off": True, "to": target, "display_name": cfg.display_name},
+            properties=FunctionCallResultProperties(run_llm=False),
+        )
+
+    # 把 handoff_to 一并注册进 context（启动前，set_tools 安全，不跳队列）
+    context.set_tools([get_weather, handoff_to])
+
     pipeline = Pipeline(
         [
             transport.input(),
@@ -177,22 +241,80 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         idle_timeout_secs=runner_args.pipeline_idle_timeout_secs,
     )
 
+    async def _broadcast_sessions_update(worker, sm):
+        """把最新会话列表 + active 会话推给前端，前端刷新会话栏."""
+        await worker.queue_frames(
+            [
+                RTVIServerMessageFrame(
+                    data={
+                        "type": "sessions_update",
+                        "sessions": sm.list_sessions(),
+                        "active_session_id": sm.active_session_id,
+                        "active_persona": sm.active_name,
+                    }
+                )
+            ]
+        )
+
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
-        logger.info(f"Client connected, greeting from {sm.active.display_name}")
+        logger.info(f"Client connected, persona={sm.active.display_name}")
         # P2: 先推一次 agent 状态全量快照，让前端拿到初始状态
         await worker.queue_frames(
             [RTVIServerMessageFrame(data=asm.snapshot())]
         )
-        context.add_message(
-            {"role": "user", "content": GREETING_PROMPTS["initial"]}
+        # 推当前会话列表 + active 会话元数据，前端用来渲染会话栏
+        await worker.queue_frames(
+            [
+                RTVIServerMessageFrame(
+                    data={
+                        "type": "sessions_update",
+                        "sessions": sm.list_sessions(),
+                        "active_session_id": sm.active_session_id,
+                        "active_persona": sm.active_name,
+                    }
+                )
+            ]
         )
-        await worker.queue_frames([LLMRunFrame()])
+        # 会话历史回放：从会话缓存取（带 persona 字段），排除 system/greeting prompt
+        msgs = sm._sessions.get(sm.active_session_id, [])
+        replay = []
+        skipped_greeting = False
+        for m in msgs:
+            if not isinstance(m, dict):
+                continue
+            if m.get("role") not in ("user", "assistant"):
+                continue
+            if (
+                not skipped_greeting
+                and m.get("role") == "user"
+                and m.get("content") in GREETING_PROMPTS.values()
+            ):
+                skipped_greeting = True
+                continue
+            replay.append({"role": m["role"], "content": m.get("content", ""), "persona": m.get("persona", sm.active_name)})
+        if replay:
+            await worker.queue_frames(
+                [RTVIServerMessageFrame(data={"type": "history_replay", "messages": replay})]
+            )
+            logger.info(f"Replayed {len(replay)} history messages")
 
-    # P3.1 / P6: 前端 client message 路由
-    # set_persona      → 切 persona（已有）
-    # get_config       → 返回 personas_default + personas_current + provider 元信息
-    # update_config    → 把前端 diff 合并进内存 override（下次切到该 persona 时生效）
+        # 没有真实对话历史则开场打招呼；有历史则接着聊
+        has_real_history = len(replay) > 0
+        if not has_real_history:
+            context.add_message(
+                {"role": "user", "content": GREETING_PROMPTS["initial"]}
+            )
+            await worker.queue_frames([LLMRunFrame()])
+
+    # P3.1 / P6 / 会话管理: 前端 client message 路由
+    # set_persona       → 会话内切 persona（换 system 头 + voice，不丢历史）
+    # get_config        → persona 配置 + provider 元信息
+    # update_config     → persona 配置 override
+    # list_sessions     → 会话列表
+    # new_session       → 新建会话
+    # switch_session    → 切换会话
+    # delete_session    → 删除会话
     @worker.rtvi.event_handler("on_client_message")
     async def on_client_message(rtvi, message):
         msg_type = getattr(message, "type", None)
@@ -211,7 +333,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
                 "personas_default": {k: v.__dict__ for k, v in sm.defaults().items()},
                 "personas_current": {k: v.__dict__ for k, v in sm.current().items()},
                 "active_persona": sm.active_name,
-                "default_persona": sm._default,
+                "default_persona": sm._default_persona,
                 "provider": _collect_provider_metadata(),
             }
             await rtvi.send_server_response(message, payload)
@@ -223,9 +345,65 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             await rtvi.send_server_response(message, {"ok": True, "applied": applied})
             return
 
+        # ----- 会话管理 -----
+        if msg_type == "list_sessions":
+            await rtvi.send_server_response(
+                message,
+                {
+                    "sessions": sm.list_sessions(),
+                    "active_session_id": sm.active_session_id,
+                    "active_persona": sm.active_name,
+                },
+            )
+            return
+
+        if msg_type == "new_session":
+            persona = msg_data.get("persona")
+            meta = sm.new_session(persona)
+            logger.info(f"New session created: {meta.session_id}")
+            # 切 voice + 通知前端
+            await router.switch_to(meta.active_persona, triggered_by="new_session")
+            await _broadcast_sessions_update(worker, sm)
+            await rtvi.send_server_response(message, {"ok": True, "session": meta.to_dict()})
+            return
+
+        if msg_type == "switch_session":
+            sid = msg_data.get("session_id")
+            if not sid:
+                await rtvi.send_server_response(message, {"ok": False, "error": "no session_id"})
+                return
+            meta = sm.switch_session(sid)
+            if meta is None:
+                await rtvi.send_server_response(message, {"ok": False, "error": "session not found"})
+                return
+            logger.info(f"Switched to session {sid}")
+            # 切 voice + 通知前端
+            await router.switch_to(meta.active_persona, triggered_by="switch_session")
+            await _broadcast_sessions_update(worker, sm)
+            await rtvi.send_server_response(message, {"ok": True, "session": meta.to_dict()})
+            return
+
+        if msg_type == "delete_session":
+            sid = msg_data.get("session_id")
+            if not sid:
+                await rtvi.send_server_response(message, {"ok": False, "error": "no session_id"})
+                return
+            ok = sm.delete_session(sid)
+            if not ok:
+                await rtvi.send_server_response(message, {"ok": False, "error": "session not found"})
+                return
+            logger.info(f"Deleted session {sid}")
+            # 删除可能触发 active 会话切换，同步 voice + 通知前端
+            await router.switch_to(sm.active_name, triggered_by="delete_session")
+            await _broadcast_sessions_update(worker, sm)
+            await rtvi.send_server_response(message, {"ok": True})
+            return
+
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         logger.info("Client disconnected")
+        # 持久化当前会话，下次重连能恢复
+        sm.persist_active()
         await worker.cancel()
 
     runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)

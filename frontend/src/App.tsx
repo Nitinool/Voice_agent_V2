@@ -22,6 +22,8 @@ import { DEFAULT_PERSONA, getPersona } from './config';
 import { usePersonaPlasma } from './usePersonaPlasma';
 import { usePersonaPlasmaState } from './usePersonaPlasmaState';
 import { HistorySidebar } from './HistorySidebar';
+import { HistoryReplayInjector } from './HistoryReplayInjector';
+import { SessionActivator } from './SessionActivator';
 import { SendTextInput } from './SendTextInput';
 import { StatusOverlay } from './StatusOverlay';
 import { PersonaKaraokeOverlay } from './PersonaKaraokeOverlay';
@@ -64,6 +66,8 @@ export default function App() {
       >
         {({ handleConnect, handleDisconnect }: PipecatBaseChildProps) => (
           <div className="app-shell">
+            <HistoryReplayInjector />
+            <SessionActivator />
             <HistorySidebar />
             <main className="app-main">
               <PlasmaBackground />

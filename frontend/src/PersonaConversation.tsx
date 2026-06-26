@@ -12,7 +12,7 @@
  * 显示策略：历史栏不做 karaoke 视觉，spoken + unspoken 拼成完整字符串显示（出现得早即可）.
  * karaoke 灰/黑视觉由独立的 PersonaKaraokeOverlay 字幕组件承担.
  */
-import { Fragment, useEffect, useMemo, useRef } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useSyncExternalStore } from 'react';
 import {
   usePipecatConversation,
   usePipecatClient,
@@ -22,6 +22,7 @@ import {
 } from '@pipecat-ai/client-react';
 import { usePipecatEventStream } from '@pipecat-ai/voice-ui-kit';
 import { DEFAULT_PERSONA, getPersona } from './config';
+import { getHistoryEntries, subscribeHistoryEntries } from './historyPersonaStore';
 
 /** persona_switch 事件按时间戳排序后的轨迹，用于给 message 标 persona. */
 interface PersonaSwitchPoint {
@@ -78,6 +79,8 @@ function PersonaConversationFallback() {
 function PersonaConversationInner() {
   const { messages } = usePipecatConversation();
   const { events } = usePipecatEventStream({ maxEvents: 500 });
+  // 历史消息独立存储（不走 jotai，避免被合并且能带 persona 字段）
+  const historyEntries = useSyncExternalStore(subscribeHistoryEntries, getHistoryEntries);
 
   // 提取 persona_switch 轨迹（按时间升序）
   const switches = useMemo<PersonaSwitchPoint[]>(() => {
@@ -114,25 +117,50 @@ function PersonaConversationInner() {
   // 用消息总文字长度做依赖，避免增量更新（karaoke 增字）时不触发 scroll.
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const totalLen = useMemo(
-    () => displayMessages.reduce((sum, m) => sum + messageToText(m).length, 0),
-    [displayMessages],
+    () =>
+      historyEntries.reduce((sum, m) => sum + m.content.length, 0) +
+      displayMessages.reduce((sum, m) => sum + messageToText(m).length, 0),
+    [historyEntries, displayMessages],
   );
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     el.scrollTop = el.scrollHeight;
-  }, [totalLen, displayMessages.length]);
+  }, [totalLen, displayMessages.length, historyEntries.length]);
 
   return (
     <div className="messages" ref={scrollRef}>
-      {displayMessages.length === 0 && (
+      {displayMessages.length === 0 && historyEntries.length === 0 && (
         <div className="empty">Once connected, {getPersona(headPersona).label} will say hi…</div>
       )}
+      {/* 历史消息（独立存储，自带 persona，准确显示） */}
+      {historyEntries.map((h, i) => {
+        const key = `h-${i}`;
+        if (h.role === 'user') {
+          return (
+            <div key={key} className="msg user">
+              <span className="msg-bubble user">{h.content}</span>
+              <span className="msg-you">You</span>
+            </div>
+          );
+        }
+        const mp = getPersona(h.persona || DEFAULT_PERSONA);
+        return (
+          <div key={key} className="msg bot" style={{ ['--c' as any]: mp.color }}>
+            <span className="msg-avatar" style={{ background: mp.color }}>{mp.emoji}</span>
+            <div className="msg-col">
+              <span className="msg-name" style={{ color: mp.color }}>{mp.label}</span>
+              <span className="msg-bubble bot" style={{ borderColor: mp.color }}>{h.content}</span>
+            </div>
+          </div>
+        );
+      })}
+      {/* 实时消息（jotai，persona 靠 persona_switch 轨迹） */}
       {displayMessages.map((msg, i) => {
         const text = messageToText(msg);
         if (msg.role === 'user') {
           return (
-            <div key={i} className="msg user">
+            <div key={`l-${i}`} className="msg user">
               <span className="msg-bubble user">{text}</span>
               <span className="msg-you">You</span>
             </div>
@@ -141,7 +169,7 @@ function PersonaConversationInner() {
         const pid = personaAt(switches, msg.createdAt);
         const mp = getPersona(pid);
         return (
-          <div key={i} className="msg bot" style={{ ['--c' as any]: mp.color }}>
+          <div key={`l-${i}`} className="msg bot" style={{ ['--c' as any]: mp.color }}>
             <span className="msg-avatar" style={{ background: mp.color }}>{mp.emoji}</span>
             <div className="msg-col">
               <span className="msg-name" style={{ color: mp.color }}>{mp.label}</span>
