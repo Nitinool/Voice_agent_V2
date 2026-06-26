@@ -32,6 +32,7 @@ export interface UseSessionsResult {
   createSession: (persona?: string) => Promise<SessionInfo | null>;
   switchSession: (sid: string) => Promise<boolean>;
   deleteSession: (sid: string) => Promise<boolean>;
+  renameSession: (sid: string, title: string) => Promise<boolean>;
 }
 
 function errToString(err: unknown): string {
@@ -158,6 +159,26 @@ export function useSessions(): UseSessionsResult {
     [client],
   );
 
+  const renameSession = useCallback(
+    async (sid: string, title: string): Promise<boolean> => {
+      if (!client) return false;
+      try {
+        const resp = (await client.sendClientRequest(
+          'rename_session',
+          { session_id: sid, title },
+          5000,
+        )) as any;
+        if (resp?.ok) return true;
+        setError(resp?.error || 'rename_session failed');
+        return false;
+      } catch (err) {
+        setError(`rename_session failed: ${errToString(err)}`);
+        return false;
+      }
+    },
+    [client],
+  );
+
   return {
     sessions,
     activeSessionId,
@@ -168,5 +189,6 @@ export function useSessions(): UseSessionsResult {
     createSession,
     switchSession,
     deleteSession,
+    renameSession,
   };
 }

@@ -6,12 +6,8 @@
   A. 语音唤醒：TranscriptionFrame 命中 persona 别名 → _maybe_switch → switch_to
   B. 前端点击：RTVI client-message type=set_persona → bot.py handler → switch_to
 
-切换做的事（一次性）：
-1. SessionManager.switch_to（换 LLMContext.messages）
-2. AgentStatusManager.mark_active（更新 4 个 persona 状态）
-3. push TTSUpdateSettingsFrame（切 voice）
-4. push RTVIServerMessageFrame{persona_switch}（P1：前端 UI 主题）
-5. push RTVIServerMessageFrame{agent_status}（P2：前端状态点）
+vision 注入在 bot.py 用 user_aggregator 的 on_user_turn_started 事件实现
+（VAD 在 aggregator 内部，本 processor 在它上游收不到 UserStartedSpeakingFrame）。
 """
 
 from __future__ import annotations

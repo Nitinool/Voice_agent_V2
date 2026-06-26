@@ -74,7 +74,7 @@ class SessionMeta:
 
 
 # message 里发给 LLM 时要剥掉的非标准字段
-_NON_LLM_FIELDS = ("persona",)
+_NON_LLM_FIELDS = ("persona", "_identity_hint")
 
 
 def _strip_for_llm(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -264,17 +264,21 @@ class SessionManager:
         self, msgs: list[dict[str, Any]], persona: str
     ) -> list[dict[str, Any]]:
         """校验 messages 第一条 system 是否匹配该 persona 当前 prompt.
-        不匹配（prompt 被 override/yaml 改过）→ 用新 prompt 重建 system 头，保留后续."""
+        不匹配（prompt 被 override/yaml 改过）→ 用新 prompt 重建 system 头，保留后续.
+        注意：switch_to 会在 system prompt 后追加身份提示后缀，这里接受带后缀的也算匹配。"""
         if not msgs:
             return self._initial_messages_for(persona)
         first = msgs[0]
         expected_prompt = self._configs[persona].system_prompt
-        if (
-            isinstance(first, dict)
-            and first.get("role") == "system"
-            and first.get("content") == expected_prompt
-        ):
-            return msgs
+        if isinstance(first, dict) and first.get("role") == "system":
+            content = first.get("content", "")
+            # 完全匹配，或以原始 prompt 开头（switch_to 追加了身份提示后缀）
+            if content == expected_prompt or (
+                isinstance(content, str)
+                and content.startswith(expected_prompt)
+                and "注意：从现在起你是" in content
+            ):
+                return msgs
         logger.info(
             f"Session system prompt stale for {persona}, rebuilding system head "
             f"(keeping {len(msgs) - 1} msgs)"
@@ -386,16 +390,45 @@ class SessionManager:
         self._sessions[self._active_session_id] = merged
 
     def _derive_title(self, msgs: list[dict[str, Any]], current: str) -> str:
-        """会话标题：如果还是"新会话"且有 user 消息，用首条 user 消息前 20 字."""
+        """会话标题：如果还是"新会话"且有 user 消息，用首条 user 消息前 20 字.
+        跳过 list content（vision image 消息）和开场 greeting prompt."""
         if current and current != "新会话":
             return current
         for m in msgs:
-            if isinstance(m, dict) and m.get("role") == "user":
-                content = str(m.get("content", "")).strip()
-                # 跳过开场 greeting prompt
-                if content and not content.startswith("你好，请用一句简短的话"):
-                    return content[:20]
+            if not isinstance(m, dict) or m.get("role") != "user":
+                continue
+            content = m.get("content", "")
+            # 跳过 list content（vision image 消息），只取字符串
+            if not isinstance(content, str):
+                continue
+            content = content.strip()
+            # 跳过开场 greeting prompt、转交标记消息
+            if not content:
+                continue
+            if content.startswith("你好，请用一句简短的话"):
+                continue
+            if content.startswith("[转交自"):
+                continue
+            return content[:20]
         return current or "新会话"
+
+    def rename_session(self, sid: str, title: str) -> SessionMeta | None:
+        """修改会话标题。会话不存在返回 None."""
+        meta = next((m for m in self._session_metas if m.session_id == sid), None)
+        if meta is None:
+            return None
+        title = (title or "").strip() or "新会话"
+        meta.title = title[:50]
+        meta.updated_at = _now_iso()
+        # 重新排序 + 落盘
+        self._session_metas.sort(key=lambda m: m.updated_at, reverse=True)
+        self._persist_index()
+        # 同步到会话文件
+        msgs = self._sessions.get(sid)
+        if msgs is not None:
+            self._persist_session(sid, msgs, meta)
+        logger.info(f"Renamed session {sid} -> {meta.title}")
+        return meta
 
     def persist_active(self) -> None:
         """断开连接时调用：持久化当前会话."""
@@ -413,10 +446,18 @@ class SessionManager:
             return None
         # 同步当前 context 到会话缓存
         self._sync_context_to_session()
-        # 换当前会话 messages 的 system 头
+        # 换当前会话 messages 的 system 头。
+        # 会话内切 persona 不丢历史，但旧 persona 的对话（如豆包自我介绍）会带偏新 persona
+        # 身份。解法：system 头除了新 persona 的 prompt，追加一句身份强调，覆盖历史影响。
         sid = self._active_session_id
         msgs = self._sessions.get(sid, [])
-        new_system = {"role": "system", "content": self._configs[persona].system_prompt, "persona": persona}
+        display = self._configs[persona].display_name
+        system_content = (
+            self._configs[persona].system_prompt
+            + f"\n\n注意：从现在起你是{display}。之前的对话可能由其他助手产生，"
+            f"请忽略它们的身份和口吻，始终以{display}的身份和风格回答。"
+        )
+        new_system = {"role": "system", "content": system_content, "persona": persona}
         if msgs and isinstance(msgs[0], dict) and msgs[0].get("role") == "system":
             msgs[0] = new_system
         else:

@@ -13,6 +13,7 @@ import {
   ControlBarDivider,
   ConnectButton,
   UserAudioControl,
+  UserVideoControl,
   TranscriptOverlay,
   type PipecatBaseChildProps,
 } from '@pipecat-ai/voice-ui-kit';
@@ -26,6 +27,7 @@ import { HistoryReplayInjector } from './HistoryReplayInjector';
 import { SessionActivator } from './SessionActivator';
 import { SendTextInput } from './SendTextInput';
 import { StatusOverlay } from './StatusOverlay';
+import { CameraPreview } from './CameraPreview';
 import { PersonaKaraokeOverlay } from './PersonaKaraokeOverlay';
 
 /** Plasma 全屏背景层。挂在 PipecatAppBase children 内才能拿到 RTVI events。 */
@@ -62,6 +64,7 @@ export default function App() {
       <PipecatAppBase
         transportType="smallwebrtc"
         connectParams={{ webrtcUrl: '/api/offer' }}
+        clientOptions={{ enableMic: true, enableCam: true }}
         connectOnMount
       >
         {({ handleConnect, handleDisconnect }: PipecatBaseChildProps) => (
@@ -87,10 +90,13 @@ export default function App() {
                     fadeOutDuration={4000}
                   />
                 </div>
+                {/* 摄像头小窗（画中画），plasma 主视觉保留 */}
+                <CameraPreview />
               </div>
               <div className="app-control-bar">
                 <ControlBar>
                   <UserAudioControl />
+                  <UserVideoControl noVideo noDevicePicker />
                   {/*
                     Disconnect 后 small-webrtc-transport 内部的 DailyMediaManager
                     无法干净复用（Daily call 对象 leave() 后 startCamera() 不再

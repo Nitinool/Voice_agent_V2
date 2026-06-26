@@ -21,7 +21,7 @@ from loguru import logger
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import FunctionCallResultProperties, LLMRunFrame
+from pipecat.frames.frames import FunctionCallResultProperties, LLMRunFrame, UserImageRequestFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -29,6 +29,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 from pipecat.runner.types import RunnerArguments, SmallWebRTCRunnerArguments
 from pipecat.services.deepgram.stt import DeepgramSTTService
@@ -43,6 +44,7 @@ from agent_status import AgentStatusManager
 from mimo_tts import MimoTTSService
 from persona_router import PersonaRouter
 from session_manager import SessionManager
+from vision_appender import VisionContextAppender
 from weather_tool import get_weather
 
 load_dotenv(override=True)
@@ -165,6 +167,22 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     router = PersonaRouter(sm, asm)
 
+    # vision：用户开始说话时，往上游推 UserImageRequestFrame，让 transport 抓一帧
+    # 摄像头视频加进 LLM context（append_to_context=True）。这样 LLM 回答时能看画面。
+    # 用 user_aggregator 的 on_user_turn_started 事件触发（VAD 在 aggregator 内部，
+    # PersonaRouter 在它上游收不到 UserStartedSpeakingFrame）。
+    # 参考 pipecat smallwebrtc transport 的 request_participant_image 机制。
+    @user_aggregator.event_handler("on_user_turn_started")
+    async def on_user_turn_started(aggregator, strategy):
+        req = UserImageRequestFrame(
+            user_id="",
+            text="（用户当前的摄像头画面）",
+            append_to_context=True,
+            video_source="camera",
+        )
+        await aggregator.push_frame(req, FrameDirection.UPSTREAM)
+        logger.debug("Vision: requested camera frame at user turn start")
+
     # handoff_to：persona 交接工具。闭包捕获 router/sm。
     # 时序设计（解决"转交话被记成 target 说的"问题）：
     #   LLM 输出 content + tool_call 是并发的，content 的 TTS 和 tool 执行会抢，
@@ -222,12 +240,17 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     # 把 handoff_to 一并注册进 context（启动前，set_tools 安全，不跳队列）
     context.set_tools([get_weather, handoff_to])
 
+    # vision：在 LLM 前拦截摄像头帧加进 context（标准 pipeline 里图要到 LLM 后才进 context，
+    # 本 processor 让当轮 LLM 就能看到画面）
+    vision_appender = VisionContextAppender(context)
+
     pipeline = Pipeline(
         [
             transport.input(),
             stt,
             router,            # 唤醒名检测 + 切 persona
             user_aggregator,
+            vision_appender,   # 摄像头帧 → context（LLM 前）
             llm,
             tts,
             transport.output(),
@@ -285,14 +308,25 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
                 continue
             if m.get("role") not in ("user", "assistant"):
                 continue
+            content = m.get("content", "")
+            # content 可能是 list（vision image 消息 / tool_calls 的 None）——提取文本部分，
+            # 非 string 一律转成可显示文本或跳过
+            if isinstance(content, list):
+                text_parts = [
+                    p.get("text", "") for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                ]
+                content = " ".join(text_parts).strip()
+            if not isinstance(content, str) or not content:
+                continue
             if (
                 not skipped_greeting
                 and m.get("role") == "user"
-                and m.get("content") in GREETING_PROMPTS.values()
+                and content in GREETING_PROMPTS.values()
             ):
                 skipped_greeting = True
                 continue
-            replay.append({"role": m["role"], "content": m.get("content", ""), "persona": m.get("persona", sm.active_name)})
+            replay.append({"role": m["role"], "content": content, "persona": m.get("persona", sm.active_name)})
         if replay:
             await worker.queue_frames(
                 [RTVIServerMessageFrame(data={"type": "history_replay", "messages": replay})]
@@ -399,6 +433,20 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             await rtvi.send_server_response(message, {"ok": True})
             return
 
+        if msg_type == "rename_session":
+            sid = msg_data.get("session_id")
+            title = msg_data.get("title")
+            if not sid or title is None:
+                await rtvi.send_server_response(message, {"ok": False, "error": "need session_id and title"})
+                return
+            meta = sm.rename_session(sid, str(title))
+            if meta is None:
+                await rtvi.send_server_response(message, {"ok": False, "error": "session not found"})
+                return
+            await _broadcast_sessions_update(worker, sm)
+            await rtvi.send_server_response(message, {"ok": True, "session": meta.to_dict()})
+            return
+
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         logger.info("Client disconnected")
@@ -418,7 +466,11 @@ async def bot(runner_args: RunnerArguments):
         return
     transport: SmallWebRTCTransport = SmallWebRTCTransport(
         webrtc_connection=runner_args.webrtc_connection,
-        params=TransportParams(audio_in_enabled=True, audio_out_enabled=True),
+        params=TransportParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            video_in_enabled=True,  # 接收用户摄像头视频，供 vision LLM 看画面
+        ),
     )
     await run_bot(transport, runner_args)
 

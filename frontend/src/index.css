@@ -90,6 +90,29 @@ html, body, #root {
   min-height: 0;
 }
 
+/* 摄像头小窗（画中画）：右下角浮在 plasma 上，可拖动 */
+.camera-preview {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  width: 200px;
+  height: 150px;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid rgba(0, 0, 0, 0.25);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  background: #000;
+  z-index: 3;
+  cursor: move;
+  touch-action: none; /* 防止拖动时触发滚动 */
+  user-select: none;
+}
+.camera-preview video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
 /* 字幕/状态浮层：在 plasma 下方居中（不再叠加在 plasma 中央） */
 .transcript-stage {
   position: absolute;
@@ -188,6 +211,13 @@ html, body, #root {
 .app-control-bar [data-slot="card-content"] button {
   padding-left: 8px !important;
   padding-right: 8px !important;
+}
+
+/* UserVideoControl noVideo 后的 wrapper 跟 UserAudioControl 对齐：
+   强制 flex 居中，跟音频控件按钮组同一基线 */
+.app-control-bar [data-slot="card-content"] > div.relative {
+  display: flex;
+  align-items: center;
 }
 
 /* === SendTextInput：黑色轮廓 + 黑色文字，跟整体黑字风格统一 === */
@@ -396,12 +426,40 @@ html, body, #root {
   align-items: center;
   opacity: 0.6;
 }
-.session-item:hover .session-item-del {
+.session-item:hover .session-item-del,
+.session-item:hover .session-item-edit {
   display: flex;
 }
+.session-item-edit {
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  color: var(--color-muted-foreground);
+  cursor: pointer;
+  padding: 2px;
+  border-radius: 4px;
+  display: none;
+  align-items: center;
+  opacity: 0.6;
+}
+.session-item-edit:hover,
 .session-item-del:hover {
   opacity: 1;
   color: #b91c1c;
+}
+.session-item-edit:hover {
+  color: var(--color-foreground);
+}
+.session-item-input {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  padding: 2px 4px;
+  border: 1px solid var(--color-primary, #000);
+  border-radius: 4px;
+  background: var(--color-background);
+  color: var(--color-foreground);
+  outline: none;
 }
 
 /* === 嵌入 header 的状态指示 === */
