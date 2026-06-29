@@ -25,6 +25,7 @@ import { usePersonaPlasmaState } from './usePersonaPlasmaState';
 import { HistorySidebar } from './HistorySidebar';
 import { HistoryReplayInjector } from './HistoryReplayInjector';
 import { SessionActivator } from './SessionActivator';
+import { ImageMessageListener } from './ImageMessageListener';
 import { SendTextInput } from './SendTextInput';
 import { StatusOverlay } from './StatusOverlay';
 import { CameraPreview } from './CameraPreview';
@@ -70,6 +71,7 @@ export default function App() {
         {({ handleConnect, handleDisconnect }: PipecatBaseChildProps) => (
           <div className="app-shell">
             <HistoryReplayInjector />
+            <ImageMessageListener />
             <SessionActivator />
             <HistorySidebar />
             <main className="app-main">

@@ -23,6 +23,7 @@ import {
 import { usePipecatEventStream } from '@pipecat-ai/voice-ui-kit';
 import { DEFAULT_PERSONA, getPersona } from './config';
 import { getHistoryEntries, subscribeHistoryEntries } from './historyPersonaStore';
+import { getImages, subscribeImages } from './imageStore';
 
 /** persona_switch 事件按时间戳排序后的轨迹，用于给 message 标 persona. */
 interface PersonaSwitchPoint {
@@ -81,6 +82,8 @@ function PersonaConversationInner() {
   const { events } = usePipecatEventStream({ maxEvents: 500 });
   // 历史消息独立存储（不走 jotai，避免被合并且能带 persona 字段）
   const historyEntries = useSyncExternalStore(subscribeHistoryEntries, getHistoryEntries);
+  // 生成的图片（后端 generate_image 工具推来的）
+  const images = useSyncExternalStore(subscribeImages, getImages);
 
   // 提取 persona_switch 轨迹（按时间升序）
   const switches = useMemo<PersonaSwitchPoint[]>(() => {
@@ -178,6 +181,15 @@ function PersonaConversationInner() {
           </div>
         );
       })}
+      {/* 生成的图片（实时，不进历史） */}
+      {images.map((img) => (
+        <div key={`img-${img.id}`} className="msg bot">
+          <span className="msg-bubble bot msg-image-bubble">
+            <img src={img.url} alt={img.prompt} className="msg-image" />
+            <span className="msg-image-prompt">{img.prompt}</span>
+          </span>
+        </div>
+      ))}
     </div>
   );
 }

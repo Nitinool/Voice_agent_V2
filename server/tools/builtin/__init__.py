@@ -6,3 +6,4 @@
 
 # 导入即注册（register_all 也会 import 本模块）
 from tools.builtin import weather  # noqa: F401
+from tools.builtin import image_gen  # noqa: F401

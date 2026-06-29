@@ -782,3 +782,22 @@ html, body, #root {
   border-left: 2px solid var(--c, var(--color-primary));
   padding-left: 4px;
 }
+
+/* 生成的图片消息 */
+.msg-image-bubble {
+  padding: 6px !important;
+  max-width: 320px;
+}
+.msg-image {
+  display: block;
+  width: 100%;
+  max-width: 300px;
+  border-radius: 8px;
+}
+.msg-image-prompt {
+  display: block;
+  font-size: 11px;
+  color: var(--color-muted-foreground);
+  margin-top: 4px;
+  font-style: italic;
+}
