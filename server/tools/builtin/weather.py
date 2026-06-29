@@ -1,10 +1,7 @@
-"""天气查询工具 —— function calling 示例.
+"""tools/builtin/weather.py — 天气查询工具（迁移自 weather_tool.py）.
 
-LLM 注册 get_weather 后，用户问"北京天气怎么样"，LLM 会自动调用本工具，
-工具返回结构化数据，LLM 再用自然语言说出来。
-
-数据源：t.weather.itboy.net（社区维护的中国天气网镜像，返回标准 JSON）。
-城市用 9 位 citycode（中国天气网编码，如北京 101010100）。
+结构化版本：用 ToolDef 显式定义 JSON Schema + async handler，
+注册到 tools.registry。pipecat 的 FunctionSchema 自动注册到 LLM service。
 """
 
 from __future__ import annotations
@@ -16,8 +13,10 @@ from loguru import logger
 
 from pipecat.services.llm_service import FunctionCallParams
 
-# 常用城市 9 位 citycode（演示用，覆盖 20 个主要城市）
-# 来源：中国天气网城市编码
+from tools.base import ToolDef
+from tools.registry import register
+
+# 常用城市 9 位 citycode（中国天气网编码）
 CITY_CODE_MAP: dict[str, str] = {
     "北京": "101010100",
     "上海": "101020100",
@@ -41,21 +40,23 @@ CITY_CODE_MAP: dict[str, str] = {
     "济南": "101120101",
 }
 
-# 接口地址（{code} 替换为 9 位 citycode）
 WEATHER_API = "http://t.weather.itboy.net/api/weather/city/{code}"
 
 
-async def get_weather(params: FunctionCallParams, city: str) -> None:
-    """查询指定城市的实时天气情况。
+async def _get_weather(params: FunctionCallParams) -> None:
+    """查询指定城市的实时天气情况.
 
     当用户询问某个城市的天气、温度、是否下雨等问题时调用此工具。
-
-    Args:
-        city: 城市中文名，如"北京"、"上海"、"深圳"。必须是常用城市。
+    支持多城市对比：用户问"北京和上海哪个凉快"时，分别调用本工具查每个城市。
     """
+    # FunctionSchema handler 只收 params，参数从 params.arguments 取
+    # （pipecat 调 FunctionCallHandler 时只传 params，不像 direct function 拆关键字参数）
+    city = params.arguments.get("city", "")
+    if not city:
+        await params.result_callback({"error": "缺少城市参数 city"})
+        return
     code = CITY_CODE_MAP.get(city)
     if not code:
-        # 城市不在码表里 —— 告诉 LLM 支持哪些城市，让它引导用户
         supported = "、".join(CITY_CODE_MAP.keys())
         await params.result_callback(
             {"error": f"暂不支持查询「{city}」的天气", "supported_cities": supported}
@@ -73,7 +74,9 @@ async def get_weather(params: FunctionCallParams, city: str) -> None:
         return
 
     if data.get("status") != 200:
-        await params.result_callback({"error": f"查询{city}天气失败: {data.get('message', '未知错误')}"})
+        await params.result_callback(
+            {"error": f"查询{city}天气失败: {data.get('message', '未知错误')}"}
+        )
         return
 
     city_info = data.get("cityInfo", {})
@@ -92,3 +95,23 @@ async def get_weather(params: FunctionCallParams, city: str) -> None:
             "cold_advice": weather_data.get("ganmao", ""),
         }
     )
+
+
+# 模块导入时自动注册到全局 registry
+register(ToolDef(
+    name="get_weather",
+    description=(
+        "查询指定城市的实时天气情况。当用户询问某个城市的天气、温度、是否下雨等"
+        "问题时调用此工具。支持多城市对比：用户问『北京和上海哪个凉快』时，"
+        "分别调用本工具查每个城市，再自己对比。"
+    ),
+    properties={
+        "city": {
+            "type": "string",
+            "description": "城市中文名，如『北京』、『上海』、『深圳』。必须是常用城市。",
+        },
+    },
+    required=["city"],
+    handler=_get_weather,
+    read_only=True,
+))

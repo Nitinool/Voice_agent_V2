@@ -44,8 +44,10 @@ from agent_status import AgentStatusManager
 from mimo_tts import MimoTTSService
 from persona_router import PersonaRouter
 from session_manager import SessionManager
+from skills.loader import load_skills
+from skills.registry import get_active_skill_contents
+from tools.registry import get_all_schemas, register_all
 from vision_appender import VisionContextAppender
-from weather_tool import get_weather
 
 load_dotenv(override=True)
 
@@ -112,11 +114,15 @@ def _collect_provider_metadata() -> dict:
 
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
+    # 注册所有结构化工具（builtin/ 下各模块导入时自动 register 到全局 registry）
+    register_all()
+    # 加载所有 skill（SKILL.md 知识包，注入 system prompt 告诉 LLM 何时用 tool）
+    load_skills()
+    skill_contents = get_active_skill_contents()
     # SessionManager（先建空 context，让它填 default persona 的 system prompt）
-    # tools 注册到 context：direct function（get_weather）的 name/签名/docstring
-    # 自动变成 schema，LLM service 自动注册，无需 register_function。
-    context = LLMContext(tools=[get_weather])
-    sm = SessionManager(_PERSONAS_YAML, context)
+    # skill 内容拼到每个 persona 的 system prompt 末尾（见 _runtime_prompt）
+    context = LLMContext()
+    sm = SessionManager(_PERSONAS_YAML, context, skill_contents=skill_contents)
     # 前端切会话 reload 时，URL ?session=sid → 连接后发 switch_session（见 SessionActivator）。
     # 这里不靠 requestData 传 session_id（链路不稳），启动时按默认最新会话激活即可，
     # SessionActivator 会在连接后纠正到目标会话。
@@ -237,8 +243,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             properties=FunctionCallResultProperties(run_llm=False),
         )
 
-    # 把 handoff_to 一并注册进 context（启动前，set_tools 安全，不跳队列）
-    context.set_tools([get_weather, handoff_to])
+    # 注册所有 tool 到 context：registry 里的结构化 tool + handoff_to（闭包工具，暂留此处）
+    context.set_tools([*get_all_schemas(), handoff_to])
 
     # vision：在 LLM 前拦截摄像头帧加进 context（标准 pipeline 里图要到 LLM 后才进 context，
     # 本 processor 让当轮 LLM 就能看到画面）

@@ -89,8 +89,15 @@ def _strip_for_llm(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 class SessionManager:
-    def __init__(self, config_path: Path, llm_context: LLMContext, data_dir: Path | None = None):
+    def __init__(
+        self,
+        config_path: Path,
+        llm_context: LLMContext,
+        data_dir: Path | None = None,
+        skill_contents: str = "",
+    ):
         self._context: LLMContext = llm_context
+        self._skill_contents: str = skill_contents
         self._configs: dict[str, PersonaConfig] = {}
         # 出厂默认值（personas.yaml 加载时快照），供前端 "reset" 用，运行时不可变
         self._defaults: dict[str, PersonaConfig] = {}
@@ -133,17 +140,35 @@ class SessionManager:
         self._default_persona = data.get("default_persona", next(iter(self._configs)))
         if self._default_persona not in self._configs:
             raise ValueError(f"default_persona '{self._default_persona}' not found")
+        self._default_persona = data.get("default_persona", next(iter(self._configs)))
+        if self._default_persona not in self._configs:
+            raise ValueError(f"default_persona '{self._default_persona}' not found")
         logger.info(
             f"SessionManager loaded {len(self._configs)} personas, "
             f"default = {self._configs[self._default_persona].display_name}"
         )
+
+    def _runtime_prompt(self, persona: str, with_hint: bool = False) -> str:
+        """构造运行时 system prompt：原始 prompt + skill 内容 +（可选）身份提示.
+
+        skill 内容（tool 使用说明）拼到原始 prompt 末尾，所有 persona 共享。
+        with_hint=True 时再追加身份提示（persona 切换时用，覆盖旧历史身份影响）。
+        """
+        display = self._configs[persona].display_name
+        content = self._configs[persona].system_prompt + self._skill_contents
+        if with_hint:
+            content += (
+                f"\n\n注意：从现在起你是{display}。之前的对话可能由其他助手产生，"
+                f"请忽略它们的身份和口吻，始终以{display}的身份和风格回答。"
+            )
+        return content
 
     def _initial_messages_for(self, persona: str) -> list[dict[str, Any]]:
         """某 persona 的初始化 messages（带 persona 字段的 system 头）."""
         return [
             {
                 "role": "system",
-                "content": self._configs[persona].system_prompt,
+                "content": self._runtime_prompt(persona),
                 "persona": persona,
             }
         ]
@@ -263,20 +288,18 @@ class SessionManager:
     def _validated_messages(
         self, msgs: list[dict[str, Any]], persona: str
     ) -> list[dict[str, Any]]:
-        """校验 messages 第一条 system 是否匹配该 persona 当前 prompt.
-        不匹配（prompt 被 override/yaml 改过）→ 用新 prompt 重建 system 头，保留后续.
-        注意：switch_to 会在 system prompt 后追加身份提示后缀，这里接受带后缀的也算匹配。"""
+        """校验 messages 第一条 system 是否匹配该 persona 当前运行时 prompt
+        （原始 prompt + skill 内容）。不匹配（prompt 被 override/yaml 改过）→ 重建.
+        接受 switch_to 追加身份提示后缀的版本（以运行时 prompt 开头）."""
         if not msgs:
             return self._initial_messages_for(persona)
         first = msgs[0]
-        expected_prompt = self._configs[persona].system_prompt
+        expected = self._runtime_prompt(persona)
         if isinstance(first, dict) and first.get("role") == "system":
             content = first.get("content", "")
-            # 完全匹配，或以原始 prompt 开头（switch_to 追加了身份提示后缀）
-            if content == expected_prompt or (
-                isinstance(content, str)
-                and content.startswith(expected_prompt)
-                and "注意：从现在起你是" in content
+            # 完全匹配，或以运行时 prompt 开头（switch_to 追加了身份提示后缀）
+            if content == expected or (
+                isinstance(content, str) and content.startswith(expected)
             ):
                 return msgs
         logger.info(
@@ -284,7 +307,7 @@ class SessionManager:
             f"(keeping {len(msgs) - 1} msgs)"
         )
         new_msgs = list(msgs)
-        new_msgs[0] = {"role": "system", "content": expected_prompt, "persona": persona}
+        new_msgs[0] = {"role": "system", "content": expected, "persona": persona}
         return new_msgs
 
     def new_session(self, persona: str | None = None) -> SessionMeta:
@@ -451,13 +474,12 @@ class SessionManager:
         # 身份。解法：system 头除了新 persona 的 prompt，追加一句身份强调，覆盖历史影响。
         sid = self._active_session_id
         msgs = self._sessions.get(sid, [])
-        display = self._configs[persona].display_name
-        system_content = (
-            self._configs[persona].system_prompt
-            + f"\n\n注意：从现在起你是{display}。之前的对话可能由其他助手产生，"
-            f"请忽略它们的身份和口吻，始终以{display}的身份和风格回答。"
-        )
-        new_system = {"role": "system", "content": system_content, "persona": persona}
+        # 换 system 头：新 persona 的运行时 prompt（含 skill + 身份提示）
+        new_system = {
+            "role": "system",
+            "content": self._runtime_prompt(persona, with_hint=True),
+            "persona": persona,
+        }
         if msgs and isinstance(msgs[0], dict) and msgs[0].get("role") == "system":
             msgs[0] = new_system
         else:
@@ -556,11 +578,11 @@ class SessionManager:
         return applied
 
     def _rebuild_active_system_head(self) -> None:
-        """当前 active 会话的 system 头用最新 prompt 重建."""
+        """当前 active 会话的 system 头用最新运行时 prompt 重建（含 skill）."""
         sid = self._active_session_id
         msgs = self._sessions.get(sid, [])
         pid = self._active_persona
-        new_system = {"role": "system", "content": self._configs[pid].system_prompt, "persona": pid}
+        new_system = {"role": "system", "content": self._runtime_prompt(pid), "persona": pid}
         if msgs and isinstance(msgs[0], dict) and msgs[0].get("role") == "system":
             msgs[0] = new_system
         else:
