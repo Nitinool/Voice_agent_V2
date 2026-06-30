@@ -95,7 +95,10 @@ class SessionManager:
         llm_context: LLMContext,
         data_dir: Path | None = None,
         skill_contents: str = "",
+        greeting_prompts: set[str] | None = None,
     ):
+        # 开场提示词集合（_derive_title 跳过这些，避免把开场当标题）
+        self._greeting_prompts: set[str] = greeting_prompts or set()
         self._context: LLMContext = llm_context
         self._skill_contents: str = skill_contents
         self._configs: dict[str, PersonaConfig] = {}
@@ -140,9 +143,6 @@ class SessionManager:
         self._default_persona = data.get("default_persona", next(iter(self._configs)))
         if self._default_persona not in self._configs:
             raise ValueError(f"default_persona '{self._default_persona}' not found")
-        self._default_persona = data.get("default_persona", next(iter(self._configs)))
-        if self._default_persona not in self._configs:
-            raise ValueError(f"default_persona '{self._default_persona}' not found")
         logger.info(
             f"SessionManager loaded {len(self._configs)} personas, "
             f"default = {self._configs[self._default_persona].display_name}"
@@ -172,6 +172,56 @@ class SessionManager:
                 "persona": persona,
             }
         ]
+
+    def replay_messages(self, session_id: str | None = None) -> list[dict[str, Any]]:
+        """返回某会话的可回放历史消息（供前端 history_replay）.
+
+        从会话缓存取（带 persona 字段），排除 system/greeting prompt/转交标记/vision image。
+        content 是 list（vision image）的提取 text 部分，非 string 跳过。
+        返回 [{role, content, persona}, ...]，role 只含 user/assistant。
+
+        Args:
+            session_id: 会话 id，None 用 active 会话.
+        """
+        sid = session_id or self._active_session_id
+        msgs = self._sessions.get(sid, [])
+        replay: list[dict[str, Any]] = []
+        skipped_greeting = False
+        for m in msgs:
+            if not isinstance(m, dict):
+                continue
+            if m.get("role") not in ("user", "assistant"):
+                continue
+            content = m.get("content", "")
+            # content 可能是 list（vision image 消息）——提取文本部分
+            if isinstance(content, list):
+                text_parts = [
+                    p.get("text", "")
+                    for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                ]
+                content = " ".join(text_parts).strip()
+            if not isinstance(content, str) or not content:
+                continue
+            # 跳过开场 greeting prompt（只跳第一条）
+            if (
+                not skipped_greeting
+                and m.get("role") == "user"
+                and content in self._greeting_prompts
+            ):
+                skipped_greeting = True
+                continue
+            # 跳过转交标记消息（handoff 内部标记，不该作为普通历史显示）
+            if content.startswith("[转交自"):
+                continue
+            replay.append(
+                {
+                    "role": m["role"],
+                    "content": content,
+                    "persona": m.get("persona", self._active_persona),
+                }
+            )
+        return replay
 
     # ===================== 会话索引持久化 =====================
 
@@ -393,28 +443,52 @@ class SessionManager:
         """把 LLMContext 里的最新 messages 同步回当前会话的内存缓存，并补 persona 字段.
 
         aggregator 往 context 加消息时只放 role/content，不带 persona。我们同步时
-        给每条没有 persona 的消息补上"它产生时的 active persona"。
-        简化：user/assistant 消息没 persona 的，统一标当前 active_persona。
-        （handoff 期间产生的消息，persona 已在 handoff_to 里手动标好，不会被覆盖。）
+        按 (role, content) 匹配会话缓存里的旧消息拿 persona，避免按下标导致错位
+        （vision 清图删中间消息后下标会错位）。
+
+        匹配规则：同 role + 同 content 的消息，从会话缓存按顺序消费（第一个赢），
+        避免重复消息互相串。没匹配上的用当前 active_persona。
         """
         if not self._active_session_id:
             return
         ctx_msgs = list(self._context.messages)
         sess_msgs = self._sessions.get(self._active_session_id, [])
-        # 用 context 的消息覆盖会话缓存，但保留会话里已有的 persona 字段
+        # 构造可消费的 persona 查找表：key=(role, content_str) → 队列的 persona
+        from collections import defaultdict, deque
+
+        persona_lookup: dict[tuple, deque[str]] = defaultdict(deque)
+        for m in sess_msgs:
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role", "")
+            content = m.get("content", "")
+            # content 可能是 list（vision image），统一转字符串做 key
+            content_key = str(content)
+            p = m.get("persona")
+            if p:
+                persona_lookup[(role, content_key)].append(p)
+
         merged: list[dict[str, Any]] = []
-        for i, m in enumerate(ctx_msgs):
+        for m in ctx_msgs:
             if not isinstance(m, dict):
                 merged.append(m)
                 continue
-            existing = sess_msgs[i] if i < len(sess_msgs) and isinstance(sess_msgs[i], dict) else {}
-            persona = existing.get("persona") or m.get("persona") or self._active_persona
+            role = m.get("role", "")
+            content = m.get("content", "")
+            content_key = str(content)
+            # 优先从会话缓存匹配 persona（同 role+content 消费），其次 context 自带，最后 active
+            key = (role, content_key)
+            persona = None
+            if key in persona_lookup and persona_lookup[key]:
+                persona = persona_lookup[key].popleft()
+            if not persona:
+                persona = m.get("persona") or self._active_persona
             merged.append({**m, "persona": persona})
         self._sessions[self._active_session_id] = merged
 
     def _derive_title(self, msgs: list[dict[str, Any]], current: str) -> str:
         """会话标题：如果还是"新会话"且有 user 消息，用首条 user 消息前 20 字.
-        跳过 list content（vision image 消息）和开场 greeting prompt."""
+        跳过 list content（vision image 消息）和开场 greeting prompt、转交标记消息."""
         if current and current != "新会话":
             return current
         for m in msgs:
@@ -425,10 +499,10 @@ class SessionManager:
             if not isinstance(content, str):
                 continue
             content = content.strip()
-            # 跳过开场 greeting prompt、转交标记消息
+            # 跳过开场 greeting prompt（用 GREETING_PROMPTS 集合判断，不硬编码）、转交标记
             if not content:
                 continue
-            if content.startswith("你好，请用一句简短的话"):
+            if content in self._greeting_prompts:
                 continue
             if content.startswith("[转交自"):
                 continue
@@ -527,11 +601,20 @@ class SessionManager:
         return list(self._configs.keys())
 
     def detect_wake_name(self, text: str) -> str | None:
-        """扫描文本，命中任一别名返回 persona name；多个命中取最长别名。"""
+        """扫描文本，命中任一别名返回 persona name；多个命中取最长别名.
+
+        匹配规则（收紧，避免误触发）：
+          - 别名必须在句首，或前面是标点/空格（独立称呼，非句子中间提及）
+          - 例："小爱同学，今天天气" 命中；"我觉得小爱不好" 不命中
+        """
         candidates: list[tuple[str, str]] = []
         for name, cfg in self._configs.items():
             for alias in cfg.aliases:
-                if alias in text:
+                pos = text.find(alias)
+                if pos < 0:
+                    continue
+                # 别名必须在句首，或前面是标点/空格（独立称呼）
+                if pos == 0 or text[pos - 1] in "，。！？、；：\n\r\t ,.!?;:":
                     candidates.append((alias, name))
         if not candidates:
             return None

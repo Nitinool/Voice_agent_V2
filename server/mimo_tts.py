@@ -121,6 +121,7 @@ class MimoTTSService(TTSService):
             {"role": "assistant", "content": text},
         ]
 
+        first_chunk = True
         try:
             await self.start_ttfb_metrics()
             stream = await self._client.chat.completions.create(
@@ -132,7 +133,6 @@ class MimoTTSService(TTSService):
             )
             await self.start_tts_usage_metrics(text)
 
-            first_chunk = True
             async for chunk in stream:
                 # mimo 的 audio 字段是 OpenAI 标准之外的扩展，转 dict 拿最稳
                 # （pydantic 可能把它放进 model_extra 或者忽略，统一走 model_dump）
@@ -162,3 +162,7 @@ class MimoTTSService(TTSService):
         except Exception as e:
             logger.exception(f"{self}: TTS request failed")
             yield ErrorFrame(error=f"MimoTTS error: {e}")
+        finally:
+            # 兜底：若 0 个有效 chunk（或异常），stop_ttfb_metrics 永不调用，计时器泄漏
+            if first_chunk:
+                await self.stop_ttfb_metrics()

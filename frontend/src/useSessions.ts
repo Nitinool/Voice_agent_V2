@@ -116,25 +116,11 @@ export function useSessions(): UseSessionsResult {
   const switchSession = useCallback(
     async (sid: string): Promise<boolean> => {
       if (!client) return false;
-      // jotai 会话消息列表没有公开 clear API，切会话靠整页 reload 重置。
-      // reload 时 URL 带 ?session=sid，连接成功后 SessionActivator 会发 switch_session
-      // 给后端真正切换 + 推 history_replay。这里先确认会话存在再 reload。
-      try {
-        const resp = (await client.sendClientRequest(
-          'switch_session',
-          { session_id: sid },
-          5000,
-        )) as any;
-        if (resp?.ok) {
-          window.location.href = `${window.location.pathname}?session=${encodeURIComponent(sid)}`;
-          return true;
-        }
-        setError(resp?.error || 'switch_session failed');
-        return false;
-      } catch (err) {
-        setError(`switch_session failed: ${errToString(err)}`);
-        return false;
-      }
+      // jotani 会话消息列表没有公开 clear API，切会话靠整页 reload 重置。
+      // reload 时 URL 带 ?session=sid，连接成功后 SessionActivator 发 switch_session
+      // 给后端真正切换 + 推 history_replay。不预切换（reload 是全新 bot，预切换是冗余副作用）。
+      window.location.href = `${window.location.pathname}?session=${encodeURIComponent(sid)}`;
+      return true;
     },
     [client],
   );

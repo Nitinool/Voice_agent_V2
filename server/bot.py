@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import os
 from pathlib import Path
 
@@ -73,6 +74,8 @@ def _ensure_file_log_sink() -> None:
         enqueue=True,
         level="DEBUG",
     )
+    # 降级 aiortc VP8 解码警告（视频帧偶发解码失败是 aiortc 已知噪声，不影响功能）
+    logger.disable("aiortc.codecs.vpx")
     _FILE_SINK_ADDED = True
 
 
@@ -123,7 +126,12 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     # SessionManager（先建空 context，让它填 default persona 的 system prompt）
     # skill 内容拼到每个 persona 的 system prompt 末尾（见 _runtime_prompt）
     context = LLMContext()
-    sm = SessionManager(_PERSONAS_YAML, context, skill_contents=skill_contents)
+    sm = SessionManager(
+        _PERSONAS_YAML,
+        context,
+        skill_contents=skill_contents,
+        greeting_prompts=set(GREETING_PROMPTS.values()),
+    )
     # 前端切会话 reload 时，URL ?session=sid → 连接后发 switch_session（见 SessionActivator）。
     # 这里不靠 requestData 传 session_id（链路不稳），启动时按默认最新会话激活即可，
     # SessionActivator 会在连接后纠正到目标会话。
@@ -238,6 +246,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         # 2. 把问题作为干净的 user 消息灌进 context（此时 system 头已是 target 的 prompt）
         #    [转交自XX] 前缀让 target 知道是转交来的，prompt 引导它先承接再答。
         #    persona 由 _sync_context_to_session 自动标成当前 active（=target），符合预期。
+        #    顺序确认：assistant(tool_calls) → tool(result) → user([转交自])，协议合法。
+        #    result_callback 在 LLM 跑前完成 IN_PROGRESS → result 替换，无幻影。
         sm.context.add_message(
             {"role": "user", "content": f"[转交自{from_display}] {question}"}
         )
@@ -386,34 +396,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
                 )
             ]
         )
-        # 会话历史回放：从会话缓存取（带 persona 字段），排除 system/greeting prompt
-        msgs = sm._sessions.get(sm.active_session_id, [])
-        replay = []
-        skipped_greeting = False
-        for m in msgs:
-            if not isinstance(m, dict):
-                continue
-            if m.get("role") not in ("user", "assistant"):
-                continue
-            content = m.get("content", "")
-            # content 可能是 list（vision image 消息 / tool_calls 的 None）——提取文本部分，
-            # 非 string 一律转成可显示文本或跳过
-            if isinstance(content, list):
-                text_parts = [
-                    p.get("text", "") for p in content
-                    if isinstance(p, dict) and p.get("type") == "text"
-                ]
-                content = " ".join(text_parts).strip()
-            if not isinstance(content, str) or not content:
-                continue
-            if (
-                not skipped_greeting
-                and m.get("role") == "user"
-                and content in GREETING_PROMPTS.values()
-            ):
-                skipped_greeting = True
-                continue
-            replay.append({"role": m["role"], "content": content, "persona": m.get("persona", sm.active_name)})
+        # 会话历史回放：从会话缓存取（带 persona 字段），排除 system/greeting/转交标记
+        replay = sm.replay_messages()
         if replay:
             await worker.queue_frames(
                 [RTVIServerMessageFrame(data={"type": "history_replay", "messages": replay})]
@@ -451,8 +435,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
         if msg_type == "get_config":
             payload = {
-                "personas_default": {k: v.__dict__ for k, v in sm.defaults().items()},
-                "personas_current": {k: v.__dict__ for k, v in sm.current().items()},
+                "personas_default": {k: dataclasses.asdict(v) for k, v in sm.defaults().items()},
+                "personas_current": {k: dataclasses.asdict(v) for k, v in sm.current().items()},
                 "active_persona": sm.active_name,
                 "default_persona": sm._default_persona,
                 "provider": _collect_provider_metadata(),
