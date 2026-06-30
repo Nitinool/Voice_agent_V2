@@ -181,13 +181,15 @@ function PersonaConversationInner() {
           </div>
         );
       })}
-      {/* 生成的图片（实时，不进历史） */}
+      {/* 生成的图片（实时，不进历史）—— 点击新标签打开原图 */}
       {images.map((img) => (
         <div key={`img-${img.id}`} className="msg bot">
-          <span className="msg-bubble bot msg-image-bubble">
-            <img src={img.url} alt={img.prompt} className="msg-image" />
-            <span className="msg-image-prompt">{img.prompt}</span>
-          </span>
+          <a href={img.url} target="_blank" rel="noopener noreferrer" className="msg-image-link" title="点击查看大图">
+            <span className="msg-bubble bot msg-image-bubble">
+              <img src={img.url} alt={img.prompt} className="msg-image" />
+              <span className="msg-image-prompt">{img.prompt}</span>
+            </span>
+          </a>
         </div>
       ))}
     </div>

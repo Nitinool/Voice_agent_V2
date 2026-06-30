@@ -784,15 +784,32 @@ html, body, #root {
 }
 
 /* 生成的图片消息 */
+.msg-image-link {
+  text-decoration: none;
+  display: inline-block;
+  cursor: zoom-in;
+}
+.msg-image-link:hover .msg-image-bubble {
+  border-color: var(--color-foreground) !important;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.25);
+}
+.msg-image-link:hover .msg-image {
+  opacity: 0.9;
+}
 .msg-image-bubble {
   padding: 6px !important;
   max-width: 320px;
+  display: block;
+  border: 1px solid var(--color-border) !important;
+  border-radius: 8px;
+  transition: border-color 0.15s, box-shadow 0.15s;
 }
 .msg-image {
   display: block;
   width: 100%;
   max-width: 300px;
-  border-radius: 8px;
+  border-radius: 6px;
+  transition: opacity 0.15s;
 }
 .msg-image-prompt {
   display: block;

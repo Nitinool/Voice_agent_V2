@@ -41,6 +41,7 @@ from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.workers.runner import WorkerRunner
 
 from agent_status import AgentStatusManager
+from latency_observer import ExtendedLatencyObserver
 from mimo_tts import MimoTTSService
 from persona_router import PersonaRouter
 from session_manager import SessionManager
@@ -150,10 +151,15 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     )
 
     # LLM（不设 system_instruction，prompt 由 messages 第一项承载，避免重复警告）
+    # reasoning_effort=none 关闭推理（qwen3.7-plus 默认带 reasoning，占 92% completion
+    # token，processing 8s→1-2s，是延迟最大头）。语音闲聊场景不需要深度推理。
     llm = OpenAILLMService(
         api_key=os.environ["LLM_API_KEY"],
         base_url=os.environ["LLM_BASE_URL"],
-        settings=OpenAILLMService.Settings(model=os.environ["LLM_MODEL"]),
+        settings=OpenAILLMService.Settings(
+            model=os.environ["LLM_MODEL"],
+            extra={"reasoning_effort": "none"},
+        ),
     )
 
     # Aggregators（VAD 调严防误打断 —— 替代之前的 InputGate）
@@ -269,6 +275,81 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
         idle_timeout_secs=runner_args.pipeline_idle_timeout_secs,
     )
+
+    # 延迟监控 observer（扩展官方，多收 processing + token 用量）：
+    # 测 VADUserStoppedSpeaking → BotStartedSpeaking 端到端 + 各 service 分解。
+    latency_observer = ExtendedLatencyObserver()
+
+    @latency_observer.event_handler("on_latency_measured")
+    async def on_latency_measured(observer, latency_seconds: float):
+        logger.info(f"[LATENCY] user→bot 端到端: {latency_seconds:.2f}s")
+
+    @latency_observer.event_handler("on_latency_breakdown")
+    async def on_latency_breakdown(observer, breakdown):
+        # 打详细分解日志（含 processing + usage）
+        parts = [f"[LATENCY breakdown] 端到端分解:"]
+        if breakdown.user_turn_secs is not None:
+            parts.append(f"  user_turn(VAD+STT+turn分析): {breakdown.user_turn_secs:.2f}s")
+        for t in breakdown.ttfb:
+            parts.append(f"  {t.processor} TTFB: {t.duration_secs:.2f}s")
+        for p in breakdown.processing:
+            parts.append(f"  {p.processor} processing: {p.duration_secs:.2f}s")
+        if breakdown.text_aggregation:
+            parts.append(
+                f"  {breakdown.text_aggregation.processor} 文本聚合: "
+                f"{breakdown.text_aggregation.duration_secs:.2f}s"
+            )
+        for fc in breakdown.function_calls:
+            parts.append(f"  工具 {fc.function_name}: {fc.duration_secs:.2f}s")
+        for u in breakdown.usage:
+            rs = f", reasoning={u.reasoning_tokens}" if u.reasoning_tokens else ""
+            parts.append(
+                f"  {u.processor} tokens: prompt={u.prompt_tokens}, "
+                f"completion={u.completion_tokens}{rs}"
+            )
+        logger.info("\n".join(parts))
+        # 时间线（按发生顺序，含 processing）
+        for ev in breakdown.chronological_events():
+            logger.info(f"[LATENCY timeline] {ev}")
+        # 推前端控制台
+        await worker.queue_frames(
+            [RTVIServerMessageFrame(
+                data={
+                    "type": "latency",
+                    "user_turn": breakdown.user_turn_secs,
+                    "ttfb": [
+                        {"processor": t.processor, "duration": t.duration_secs}
+                        for t in breakdown.ttfb
+                    ],
+                    "processing": [
+                        {"processor": p.processor, "duration": p.duration_secs}
+                        for p in breakdown.processing
+                    ],
+                    "text_aggregation": breakdown.text_aggregation.duration_secs
+                    if breakdown.text_aggregation
+                    else None,
+                    "function_calls": [
+                        {"name": fc.function_name, "duration": fc.duration_secs}
+                        for fc in breakdown.function_calls
+                    ],
+                    "usage": [
+                        {
+                            "processor": u.processor,
+                            "prompt": u.prompt_tokens,
+                            "completion": u.completion_tokens,
+                            "reasoning": u.reasoning_tokens,
+                        }
+                        for u in breakdown.usage
+                    ],
+                }
+            )]
+        )
+
+    @latency_observer.event_handler("on_first_bot_speech_latency")
+    async def on_first_bot_speech_latency(observer, latency_seconds: float):
+        logger.info(f"[LATENCY] 连接→首次开口: {latency_seconds:.2f}s")
+
+    worker.add_observer(latency_observer)
 
     async def _broadcast_sessions_update(worker, sm):
         """把最新会话列表 + active 会话推给前端，前端刷新会话栏."""
